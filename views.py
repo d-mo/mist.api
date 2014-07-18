@@ -9,8 +9,6 @@ be performed inside the corresponding method functions.
 
 """
 
-
-import logging
 from datetime import datetime
 
 import traceback
@@ -37,10 +35,15 @@ import mist.io.exceptions as exceptions
 from mist.io.exceptions import *
 
 from mist.io.helpers import get_auth_header, params_from_request
+from mist.io.helpers import trigger_session_update
 from mist.io.sockio import MistNamespace, ShellNamespace
 
-
+import logging
+logging.basicConfig(level=config.PY_LOG_LEVEL,
+                    format=config.PY_LOG_FORMAT,
+                    datefmt=config.PY_LOG_FORMAT_DATE)
 log = logging.getLogger(__name__)
+
 OK = Response("OK", 200)
 
 
@@ -263,7 +266,7 @@ def toggle_backend(request):
     with user.lock_n_load():
         user.backends[backend_id].enabled = bool(int(new_state))
         user.save()
-
+    trigger_session_update(user.email, ['backends'])
     return OK
 
 
@@ -831,6 +834,7 @@ def update_rule(request):
     if ret.status_code != 200:
         log.error("Error updating rule %d:%s", ret.status_code, ret.text)
         raise ServiceUnavailableError()
+    trigger_session_update(user.email, ['monitoring'])
     return ret.json()
 
 
@@ -852,7 +856,7 @@ def delete_rule(request):
     if ret.status_code != 200:
         log.error("Error deleting rule %d:%s", ret.status_code, ret.text)
         raise ServiceUnavailableError()
-
+    trigger_session_update(user.email, ['monitoring'])
     return OK
 
 
@@ -925,7 +929,7 @@ def list_supported_providers(request):
     return {'supported_providers': config.SUPPORTED_PROVIDERS}
 
 
-@view_config(route_name='socketio')
+@view_config(route_name='socketio', renderer='json')
 def socketio(request):
     socketio_manage(request.environ,
                     namespaces={'/mist': MistNamespace,

@@ -1,10 +1,9 @@
-import logging
 import random
 import json
 import requests
 import subprocess
 import re
-from time import sleep
+from time import sleep, time
 from datetime import datetime
 from hashlib import sha256
 from StringIO import StringIO
@@ -35,6 +34,7 @@ from mist.io.exceptions import *
 
 from mist.io.helpers import trigger_session_update
 from mist.io.helpers import amqp_publish_user
+from mist.io.tasks import run_deploy_script
 from mist.io.tasks import ssh_command as async_ssh_command
 
 ## # add curl ca-bundle default path to prevent libcloud certificate error
@@ -42,10 +42,15 @@ import libcloud.security
 libcloud.security.CA_CERTS_PATH.append('cacert.pem')
 libcloud.security.CA_CERTS_PATH.append('./src/mist.io/cacert.pem')
 
+import logging
+logging.basicConfig(level=config.PY_LOG_LEVEL,
+                    format=config.PY_LOG_FORMAT,
+                    datefmt=config.PY_LOG_FORMAT_DATE)
 log = logging.getLogger(__name__)
 
 HPCLOUD_AUTH_URL = 'https://region-a.geo-1.identity.hpcloudsvc.com:35357/v2.0/tokens'
 GCE_IMAGES = ['debian-cloud', 'centos-cloud', 'suse-cloud', 'rhel-cloud']
+
 
 @core_wrapper
 def add_backend(user, title, provider, apikey, apisecret, apiurl, tenant_name,
@@ -654,7 +659,8 @@ def list_machines(user, backend_id):
 
 @core_wrapper
 def create_machine(user, backend_id, key_id, machine_name, location_id,
-                   image_id, size_id, script, image_extra, disk, image_name, size_name, location_name):
+                   image_id, size_id, script, image_extra, disk, image_name,
+                   size_name, location_name, ssh_port=22):
 
     """Creates a new virtual machine on the specified backend.
 
@@ -677,41 +683,11 @@ def create_machine(user, backend_id, key_id, machine_name, location_id,
 
     """
 
+    log.info('Creating machine %s on backend %s' % (machine_name, backend_id))
+
     if backend_id not in user.backends:
         raise BackendNotFoundError(backend_id)
     conn = connect_provider(user.backends[backend_id])
-
-    if conn.type is Provider.DOCKER:
-        if key_id and key_id in user.keypairs:
-            keypair = user.keypairs[key_id]
-            public_key = keypair.public
-        else:
-            public_key = None
-
-        node = _create_machine_docker(conn, machine_name, image_id, script, public_key=public_key)
-
-        if key_id and key_id in user.keypairs:
-            node_info = conn.inspect_node(node)
-            try:
-                port = node_info.extra['network_settings']['Ports']['22/tcp'][0]['HostPort']
-            except:
-                port = 22
-            associate_key(user, key_id, backend_id, node.id, port=int(port))
-
-        if script and public_key:
-            host = conn.connection.host
-            #consider public ip of docker server as container's ip too
-            #run script
-            ssh_command(user, backend_id=backend_id, machine_id=node.id, key_id=key_id, host=host,
-                        command=script, port=port)
-
-        return {
-            'id': node.id,
-            'name': node.name,
-            'extra': node.extra,
-            'public_ips': node.public_ips,
-            'private_ips': node.private_ips,
-        }
 
     if key_id and key_id not in user.keypairs:
         raise KeypairNotFoundError(key_id)
@@ -734,7 +710,15 @@ def create_machine(user, backend_id, key_id, machine_name, location_id,
     image = NodeImage(image_id, name=image_name, extra=image_extra, driver=conn)
     location = NodeLocation(location_id, name=location_name, country='', driver=conn)
 
-    if conn.type in [Provider.RACKSPACE_FIRST_GEN,
+    if conn.type is Provider.DOCKER:
+        node = _create_machine_docker(conn, machine_name, image_id, '', public_key=public_key)
+        if key_id and key_id in user.keypairs:
+            node_info = conn.inspect_node(node)
+            try:
+                ssh_port = int(node_info.extra['network_settings']['Ports']['22/tcp'][0]['HostPort'])
+            except:
+                pass
+    elif conn.type in [Provider.RACKSPACE_FIRST_GEN,
                      Provider.RACKSPACE]:
         node = _create_machine_rackspace(conn, public_key, script, machine_name,
                                         image, size, location)
@@ -777,7 +761,7 @@ def create_machine(user, backend_id, key_id, machine_name, location_id,
     else:
         raise BadRequestError("Provider unknown.")
 
-    associate_key(user, key_id, backend_id, node.id)
+    associate_key(user, key_id, backend_id, node.id, port=ssh_port)
 
     if script:
         from mist.io.tasks import run_deploy_script
@@ -1279,6 +1263,7 @@ def destroy_machine(user, backend_id, machine_id):
 
     """
 
+    log.info('Destroying machine %s in backend %s' % (machine_id, backend_id))
     # if machine has monitoring, disable it. the way we disable depends on
     # whether this is a standalone io installation or not
     disable_monitoring_function = None
@@ -1457,7 +1442,7 @@ def list_backends(user):
                     'title': backend.title or backend.provider,
                     'provider': backend.provider,
                     'poll_interval': backend.poll_interval,
-                    'state': 'wait' if backend.enabled else 'offline',
+                    'state': 'online' if backend.enabled else 'offline',
                     # for Provider.RACKSPACE_FIRST_GEN
                     'region': backend.region,
                     # for Provider.RACKSPACE (the new Nova provider)
@@ -1748,7 +1733,7 @@ def enable_monitoring(user, backend_id, machine_id,
         return ret_dict
     stdout = ''
     if not no_ssh:
-        async_ssh_command.delay(user, backend_id, machine_id, host, command)
+        async_ssh_command.delay(user.email, backend_id, machine_id, host, command)
 
     trigger_session_update(user.email, ['monitoring'])
 
@@ -1813,15 +1798,36 @@ def _undeploy_collectd(user, backend_id, machine_id, host):
         "sleep 2; $sudo kill -9 `cat /opt/mistio-collectd/collectd.pid`"
     )
 
-    return async_ssh_command.delay(user, backend_id, machine_id, host, command)
+    async_ssh_command.delay(user.email, backend_id, machine_id, host, command)
 
 
 def probe(user, backend_id, machine_id, host, key_id='', ssh_user=''):
     """Ping and SSH to machine and collect various metrics."""
 
+    if not host:
+        raise RequiredParameterMissingError('host')
+
     # start pinging the machine in the background
     log.info("Starting ping in the background for host %s", host)
-    ping = subprocess.Popen(["ping", "-c", "10", "-i", "0.4", "-W", "1", "-q", host], stdout=subprocess.PIPE)
+    ping = subprocess.Popen(
+        ["ping", "-c", "10", "-i", "0.4", "-W", "1", "-q", host],
+        stdout=subprocess.PIPE
+    )
+    try:
+        ret = probe_ssh_only(user, backend_id, machine_id, host,
+                             key_id=key_id, ssh_user=ssh_user)
+    except:
+        log.warning("SSH failed when probing, let's see what ping has to say.")
+        ret = {}
+    ping_out = ping.stdout.read()
+    ping.wait()
+    log.info("ping output: %s" % ping_out)
+    ret.update(parse_ping(ping_out))
+    return ret
+
+
+def probe_ssh_only(user, backend_id, machine_id, host, key_id='', ssh_user=''):
+    """Ping and SSH to machine and collect various metrics."""
 
     # run SSH commands
     command = (
@@ -1845,44 +1851,42 @@ def probe(user, backend_id, machine_id, host, key_id='', ssh_user=''):
        "\"|sh" # In case there is a default shell other than bash/sh (e.g. csh)
     )
 
-    log.warn('probing with key %s' % key_id)
+    if key_id:
+        log.warn('probing with key %s' % key_id)
 
-    try:
-        cmd_output = ssh_command(user, backend_id, machine_id,
-                                 host, command, key_id=key_id)
-    except:
-        log.warning("SSH failed when probing, let's see what ping has to say.")
-        cmd_output = ""
+    cmd_output = ssh_command(user, backend_id, machine_id,
+                             host, command, key_id=key_id)
+    cmd_output = cmd_output.replace('\r\n','').split('--------')
+    log.warn(cmd_output)
+    uptime_output = cmd_output[1]
+    loadavg = re.split('load averages?: ', uptime_output)[1].split(', ')
+    users = re.split(' users?', uptime_output)[0].split(', ')[-1].strip()
+    uptime = cmd_output[2]
+    cores = cmd_output[3]
+    ips = re.findall('inet addr:(\S+)', cmd_output[4])
+    if '127.0.0.1' in ips:
+        ips.remove('127.0.0.1')
+    pub_ips = find_public_ips(ips)
+    priv_ips = [ip for ip in ips if ip not in pub_ips]
+    return {
+        'uptime': uptime,
+        'loadavg': loadavg,
+        'cores': cores,
+        'users': users,
+        'pub_ips': pub_ips,
+        'priv_ips': priv_ips,
+        'timestamp': time(),
+    }
 
+
+def ping(host):
+    ping = subprocess.Popen(
+        ["ping", "-c", "10", "-i", "0.4", "-W", "1", "-q", host],
+        stdout=subprocess.PIPE
+    )
     ping_out = ping.stdout.read()
     ping.wait()
-    log.info("ping output: %s" % ping_out)
-
-    ret = {}
-    if cmd_output:
-        cmd_output = cmd_output.replace('\r\n','').split('--------')
-        log.warn(cmd_output)
-        uptime_output = cmd_output[1]
-        loadavg = re.split('load averages?: ', uptime_output)[1].split(', ')
-        users = re.split(' users?', uptime_output)[0].split(', ')[-1].strip()
-        uptime = cmd_output[2]
-        cores = cmd_output[3]
-        ips = re.findall('inet addr:(\S+)', cmd_output[4])
-        if '127.0.0.1' in ips:
-            ips.remove('127.0.0.1')
-        pub_ips = find_public_ips(ips)
-        priv_ips = [ip for ip in ips if ip not in pub_ips]
-        ret = {'uptime': uptime,
-               'loadavg': loadavg,
-               'cores': cores,
-               'users': users,
-               'pub_ips': pub_ips,
-               'priv_ips': priv_ips
-               }
-
-    ret.update(parse_ping(ping_out))
-
-    return ret
+    return parse_ping(ping_out)
 
 
 def find_public_ips(ips):
@@ -1898,6 +1902,7 @@ def find_public_ips(ips):
 
 
 def notify_admin(title, message=""):
+    """ This will only work on a multi-user setup configured to send emails """
     try:
         from mist.core.helpers import send_email
         send_email(title, message, config.NOTIFICATION_EMAIL)
@@ -1906,14 +1911,16 @@ def notify_admin(title, message=""):
 
 
 def notify_user(user, title, message="", **kwargs):
-    try:
-        from mist.core.helpers import send_email
-        send_email(title, message, user.email)
-    except ImportError:
-        pass
+    # Notify connected user via amqp
     payload = {'title': title, 'message': message}
     payload.update(kwargs)
     amqp_publish_user(user, routing_key='notify', data=payload)
+
+    try: # Send email in multi-user env
+        from mist.core.helpers import send_email
+        send_email("[mist.io] %s" % title, message, user.email)
+    except ImportError:
+        pass
 
 
 def find_metrics(user, backend_id, machine_id):
@@ -1949,6 +1956,7 @@ def assoc_metric(user, backend_id, machine_id, metric_id):
     if not resp.ok:
         log.error("Error in assoc_metric %d:%s", resp.status_code, resp.text)
         raise ServiceUnavailableError(resp.text)
+    trigger_session_update(user.email, [])
 
 
 def disassoc_metric(user, backend_id, machine_id, metric_id):
@@ -1967,6 +1975,7 @@ def disassoc_metric(user, backend_id, machine_id, metric_id):
     if not resp.ok:
         log.error("Error in disassoc_metric %d:%s", resp.status_code, resp.text)
         raise ServiceUnavailableError(resp.text)
+    trigger_session_update(user.email, [])
 
 
 def update_metric(user, metric_id, name=None, unit=None,
@@ -1990,6 +1999,7 @@ def update_metric(user, metric_id, name=None, unit=None,
     if not resp.ok:
         log.error("Error updating metric %d:%s", resp.status_code, resp.text)
         raise BadRequestError(resp.text)
+    trigger_session_update(user.email, [])
 
 
 def deploy_python_plugin(user, backend_id, machine_id, plugin_id,
@@ -2022,7 +2032,7 @@ def deploy_python_plugin(user, backend_id, machine_id, plugin_id,
     sftp = shell.ssh.open_sftp()
 
     tmp_dir = "/tmp/mist-python-plugin-%d" % random.randrange(2 ** 20)
-    stdout = shell.command(
+    retval, stdout = shell.command(
 """
 sudo=$(command -v sudo)
 mkdir -p %s
@@ -2050,7 +2060,7 @@ print("READ FUNCTION TEST PASSED")
     sftp.putfo(StringIO(read_function), "%s/%s_read.py" % (tmp_dir, plugin_id))
     sftp.putfo(StringIO(test_code), "%s/test.py" % tmp_dir)
 
-    test_out = shell.command("$(command -v sudo) python %s/test.py" % tmp_dir)
+    retval, test_out = shell.command("$(command -v sudo) python %s/test.py" % tmp_dir)
     stdout += test_out
 
     if not test_out.strip().endswith("READ FUNCTION TEST PASSED"):
@@ -2079,18 +2089,19 @@ collectd.register_read(read_callback)
        'plugin_instance': plugin_id}
 
     sftp.putfo(StringIO(plugin), "%s/%s.py" % (tmp_dir, plugin_id))
-    stdout += shell.command("""
+    retval, cmd_out = shell.command("""
 cd /opt/mistio-collectd/
 $(command -v sudo) mv %s/%s.py plugins/mist-python/
 $(command -v sudo) chown -R root plugins/mist-python/
 """ % (tmp_dir, plugin_id)
     )
 
+    stdout += cmd_out
+
     # Prepare collectd.conf
     script = """
 sudo=$(command -v sudo)
 cd /opt/mistio-collectd/
-$sudo mkdir -p plugins/mist-python/conf
 
 if ! grep '^Include.*plugins/mist-python' collectd.conf; then
     echo "Adding Include line in collectd.conf for plugins/mist-python/include.conf"
@@ -2100,17 +2111,15 @@ else
 fi
 if [ ! -f plugins/mist-python/include.conf ]; then
     echo "Generating plugins/mist-python/include.conf"
-    $sudo su -c 'echo -e "<LoadPlugin python>\n    Globals true\n</LoadPlugin>\n" > plugins/mist-python/include.conf'
+    $sudo su -c 'echo -e "# Do not edit this file, unless you are looking for trouble.\n\n<LoadPlugin python>\n    Globals true\n</LoadPlugin>\n\n\n<Plugin python>\n    ModulePath \\"/opt/mistio-collectd/plugins/mist-python/\\"\n    LogTraces true\n    Interactive false\n</Plugin>\n" > plugins/mist-python/include.conf'
 else
     echo "plugins/mist-python/include.conf already exists, continuing"
 fi
 
-echo "Generating config file for plugin"
-$sudo su -c 'echo -e "<Plugin python>\n    ModulePath \\"/opt/mistio-collectd/plugins/mist-python/\\"\n    LogTraces true\n    Interactive false\n    Import %(plugin_id)s\n</Plugin>\n" > plugins/mist-python/conf/%(plugin_id)s.conf'
-echo "Adding Include line for plugin conf in plugins/mist-python/include.conf"
-if ! grep '^Include.*%(plugin_id)s' plugins/mist-python/include.conf; then
+echo "Adding Import line for plugin in plugins/mist-python/include.conf"
+if ! grep '^ *Import %(plugin_id)s *$' plugins/mist-python/include.conf; then
     $sudo cp plugins/mist-python/include.conf plugins/mist-python/include.conf.backup
-    $sudo su -c 'echo Include \\"/opt/mistio-collectd/plugins/mist-python/conf/%(plugin_id)s.conf\\" >> plugins/mist-python/include.conf'
+    $sudo sed -i 's/^<\/Plugin>$/    Import %(plugin_id)s\\n<\/Plugin>/' plugins/mist-python/include.conf
     echo "Checking that python plugin is available"
     if $sudo /usr/bin/collectd -C /opt/mistio-collectd/collectd.conf -t 2>&1 | grep 'Could not find plugin python'; then
         echo "WARNING: collectd python plugin is not installed, will attempt to install it"
@@ -2123,6 +2132,7 @@ if ! grep '^Include.*%(plugin_id)s' plugins/mist-python/include.conf; then
     fi
     echo "Restarting collectd"
     $sudo /opt/mistio-collectd/collectd.sh restart
+    sleep 2
     if ! $sudo /opt/mistio-collectd/collectd.sh status; then
         echo "Restarting collectd failed, restoring include.conf"
         $sudo cp plugins/mist-python/include.conf.backup plugins/mist-python/include.conf
@@ -2130,12 +2140,13 @@ if ! grep '^Include.*%(plugin_id)s' plugins/mist-python/include.conf; then
         echo "ERROR DEPLOYING PLUGIN"
     fi
 else
-    echo "Plugin conf already included in include.conf"
+    echo "Plugin already imported in include.conf"
 fi
 $sudo rm -rf %(tmp_dir)s
 """ % {'plugin_id': plugin_id, 'tmp_dir': tmp_dir}
 
-    stdout += shell.command(script)
+    retval, cmd_out = shell.command(script)
+    stdout += cmd_out
     if stdout.strip().endswith("ERROR DEPLOYING PLUGIN"):
         raise BadRequestError(stdout)
 
@@ -2169,14 +2180,14 @@ sudo=$(command -v sudo)
 cd /opt/mistio-collectd/
 
 echo "Removing Include line for plugin conf from plugins/mist-python/include.conf"
-$sudo grep -v 'Include \\"/opt/mistio-collectd/plugins/mist-python/conf/%(plugin_id)s.conf\\"' plugins/mist-python/include.conf > /tmp/include.conf
+$sudo grep -v 'Import %(plugin_id)s$' plugins/mist-python/include.conf > /tmp/include.conf
 $sudo mv /tmp/include.conf plugins/mist-python/include.conf
 
 echo "Restarting collectd"
 $sudo /opt/mistio-collectd/collectd.sh restart
 """ % {'plugin_id': plugin_id}
 
-    stdout = shell.command(script)
+    retval, stdout = shell.command(script)
 
     shell.disconnect()
 

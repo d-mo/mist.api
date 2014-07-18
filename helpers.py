@@ -17,7 +17,15 @@ from amqp.exceptions import NotFound as AmqpNotFound
 
 from mist.io.model import User
 
-
+try:
+    from mist.core import config
+except ImportError:
+    from mist.io import config
+    
+import logging
+logging.basicConfig(level=config.PY_LOG_LEVEL,
+                    format=config.PY_LOG_FORMAT,
+                    datefmt=config.PY_LOG_FORMAT_DATE)
 log = logging.getLogger(__name__)
 
 
@@ -175,7 +183,8 @@ def amqp_subscribe(exchange, queue, callback):
     try:
         while True:
             channel.wait()
-    except Exception as exc:
+    except BaseException as exc:
+        # catch BaseException so that it catches KeyboardInterrupt
         channel.close()
         connection.close()
         amqp_log("SUBSCRIPTION ENDED: %s %s %r" % (exchange, queue, exc))
@@ -204,6 +213,21 @@ def amqp_publish_user(user, routing_key, data):
 
 def amqp_subscribe_user(user, queue, callback):
     amqp_subscribe(_amqp_user_exchange(user), queue, callback)
+
+
+def amqp_user_listening(user):
+    connection = Connection()
+    channel = connection.channel()
+    try:
+        channel.exchange_declare(exchange=_amqp_user_exchange(user),
+                                 type='fanout', passive=True)
+    except AmqpNotFound:
+        return False
+    else:
+        return True
+    finally:
+        channel.close()
+        connection.close()
 
 
 def trigger_session_update(email, sections=['backends','keys','monitoring']):

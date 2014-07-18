@@ -22,10 +22,12 @@ try:
     from mist.core.helpers import user_from_request
     from mist.core import config
     from mist.core.methods import get_stats
+    multi_user = True
 except ImportError:
     from mist.io.helpers import user_from_request
     from mist.io import config
     from mist.io.methods import get_stats
+    multi_user = False
 
 from mist.io.helpers import amqp_subscribe_user
 from mist.io.helpers import amqp_log
@@ -35,22 +37,28 @@ from mist.io import methods
 from mist.io import tasks
 from mist.io.shell import Shell
 
+import logging
+logging.basicConfig(level=config.PY_LOG_LEVEL,
+                    format=config.PY_LOG_FORMAT,
+                    datefmt=config.PY_LOG_FORMAT_DATE)
+log = logging.getLogger(__name__)
+
 
 class ShellNamespace(BaseNamespace):
     def initialize(self):
         self.user = user_from_request(self.request)
         self.channel = None
-        print "opening shell socket"
+        log.info("opening shell socket")
 
     def on_shell_open(self, data):
-        print "opened shell"
+        log.info("opened shell")
         self.shell = Shell(data['host'])
         key_id, ssh_user = self.shell.autoconfigure(self.user, data['backend_id'], data['machine_id'])
         self.channel = self.shell.ssh.invoke_shell('xterm')
         self.spawn(self.get_ssh_data)
 
     def on_shell_close(self):
-        print "closing shell"
+        log.info("closing shell")
         if self.channel:
             self.channel.close()
 
@@ -71,11 +79,10 @@ class ShellNamespace(BaseNamespace):
 
 class MistNamespace(BaseNamespace):
     def initialize(self):
-        print "init"
+        log.info("init")
         self.user = user_from_request(self.request)
-        self.probes = {}
-        self.channel = None
-        self._old_machines = set()
+        self.update_greenlet = None
+        self.running_machines = set()
 
     def spawn_later(self, delay, fn, *args, **kwargs):
         """Spawn a new process, attached to this Namespace after no less than
@@ -98,7 +105,9 @@ class MistNamespace(BaseNamespace):
         return new
 
     def on_ready(self):
-        print "Ready to go!"
+        log.info("Ready to go!")
+        if self.update_greenlet is not None:
+            self.update_greenlet.kill()
         self.update_greenlet = self.spawn(update_subscriber, self)
 
         self.monitoring_greenlet = self.spawn_later(2, check_monitoring_from_socket, self)
@@ -125,27 +134,51 @@ class MistNamespace(BaseNamespace):
 
     def process_update(self, msg):
         routing_key = msg.delivery_info.get('routing_key')
-        print "Got %s" % routing_key
+        log.info("Got %s", routing_key)
         if routing_key in set(['notify', 'probe', 'list_sizes', 'list_images',
-                               'list_machines', 'list_locations']):
+                               'list_machines', 'list_locations', 'ping']):
             self.emit(routing_key, msg.body)
+            if routing_key == 'probe':
+                log.warn('send probe')
+                
             if routing_key == 'list_machines':
-                # probe newly discovered machines
+                # probe newly discovered running machines
                 machines = msg.body['machines']
                 backend_id = msg.body['backend_id']
+                # update backend machine count in multi-user setups
+                try:
+                    if multi_user and len(machines) != self.user.backends[backend_id].machine_count:
+                        tasks.update_machine_count.delay(self.user.email, backend_id, len(machines))
+                        log.info('Updated machine count for user %s' % self.user.email)
+                except Exception as e:
+                    log.error('Cannot update machine count for user %s: %r' % (self.user.email, e))
                 for machine in machines:
-                    if (backend_id, machine['id']) in self._old_machines:
+                    bmid = (backend_id, machine['id'])
+                    if bmid in self.running_machines:
+                        # machine was running
+                        if machine['state'] != 'running':
+                            # machine no longer running
+                            self.running_machines.remove(bmid)
                         continue
-                    self._old_machines.add((backend_id, machine['id']))
+                    if machine['state'] != 'running':
+                        # machine not running
+                        continue
+                    # machine just started running
+                    self.running_machines.add(bmid)
                     ips = filter(lambda ip: ':' not in ip,
                                  machine.get('public_ips', []))
                     if not ips:
                         continue
-                    cached = tasks.Probe().smart_delay(
+                    cached = tasks.ProbeSSH().smart_delay(
                         self.user.email, backend_id, machine['id'], ips[0]
                     )
                     if cached is not None:
                         self.emit('probe', cached)
+                    cached = tasks.Ping().smart_delay(
+                        self.user.email, backend_id, machine['id'], ips[0]
+                    )
+                    if cached is not None:
+                        self.emit('ping', cached)
         elif routing_key == 'update':
             self.user.refresh()
             sections = msg.body
@@ -192,13 +225,13 @@ def list_backends_from_socket(namespace):
     user = namespace.user
     backends = methods.list_backends(user)
     namespace.emit('list_backends', backends)
-    for key, task in (('list_machines', tasks.ListMachines),
-                      ('list_images', tasks.ListImages),
-                      ('list_sizes', tasks.ListSizes),
-                      ('list_locations', tasks.ListLocations)):
+    for key, task in (('list_machines', tasks.ListMachines()),
+                      ('list_images', tasks.ListImages()),
+                      ('list_sizes', tasks.ListSizes()),
+                      ('list_locations', tasks.ListLocations())):
         for backend_id in user.backends:
             if user.backends[backend_id].enabled:
-                cached = task().smart_delay(user.email, backend_id)
+                cached = task.smart_delay(user.email, backend_id)
                 if cached is not None:
                     namespace.emit(key, cached)
 
