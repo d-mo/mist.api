@@ -109,11 +109,11 @@ class Shell(object):
                 )
                 break
             except paramiko.AuthenticationException as exc:
-                log.error("ssh exception %r", exc)
+                log.info("ssh exception %r", exc)
                 raise MachineUnauthorizedError("Couldn't connect to %s@%s:%s. %s"
                                                % (username, self.host, port, exc))
             except socket.error as exc:
-                log.error("Got ssh error: %r", exc)
+                log.warning("Got ssh error: %r", exc)
                 if not attempts:
                     raise ServiceUnavailableError("SSH timed-out repeatedly.")
 
