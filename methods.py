@@ -800,7 +800,7 @@ def create_machine(user, backend_id, key_id, machine_name, location_id,
     elif conn.type == Provider.AZURE:
         node = _create_machine_azure(conn, key_id, private_key,
                                              public_key, machine_name,
-                                             image, size, location, cloud_service_name=None)
+                                             image, size, location, networks, cloud_service_name=None)
     elif conn.type is Provider.LINODE and private_key:
         node = _create_machine_linode(conn, key_id, private_key, public_key,
                                       machine_name, image, size,
@@ -1211,13 +1211,14 @@ def _create_machine_digital_ocean(conn, key_name, private_key, public_key,
 
 
 def _create_machine_azure(conn, key_name, private_key, public_key,
-                                  machine_name, image, size, location, cloud_service_name):
+                                  machine_name, image, size, location, networks, cloud_service_name):
     """Create a machine Azure.
 
     Here there is no checking done, all parameters are expected to be
     sanitized by create_machine.
 
     """
+
     key = public_key.replace('\n', '')
     with get_temp_file(private_key) as tmp_key_path:
         try:
@@ -1226,7 +1227,8 @@ def _create_machine_azure(conn, key_name, private_key, public_key,
                 size=size,
                 image=image,
                 location=location,
-                ex_cloud_service_name=cloud_service_name
+                ex_cloud_service_name=cloud_service_name,
+                virtual_network_name=networks
             )
         except Exception as e:
             raise MachineCreationError("Azure, got exception %s" % e)
