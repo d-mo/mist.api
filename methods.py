@@ -1772,8 +1772,7 @@ def list_networks(user, backend_id):
             ret.append({
                 'id': network.id,
                 'name': network.name,
-                'extra': network.extra,
-                'subnets': network.extra.get('subnets')
+                'extra': network.extra
             })
 
         return ret
