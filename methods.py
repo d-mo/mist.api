@@ -1218,6 +1218,10 @@ def _create_machine_azure(conn, key_name, private_key, public_key,
     sanitized by create_machine.
 
     """
+    if networks and type(networks) == list:
+        network = networks[0]
+    else:
+        network = None
 
     key = public_key.replace('\n', '')
     with get_temp_file(private_key) as tmp_key_path:
@@ -1228,7 +1232,7 @@ def _create_machine_azure(conn, key_name, private_key, public_key,
                 image=image,
                 location=location,
                 ex_cloud_service_name=cloud_service_name,
-                virtual_network_name=networks
+                virtual_network_name=network
             )
         except Exception as e:
             raise MachineCreationError("Azure, got exception %s" % e)
@@ -1768,6 +1772,7 @@ def list_networks(user, backend_id):
                 'id': network.id,
                 'name': network.name,
                 'extra': network.extra,
+                'subnets': network.extra.get('subnets')
             })
 
         return ret
