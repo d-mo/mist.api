@@ -1760,7 +1760,7 @@ def list_networks(user, backend_id):
     conn = connect_provider(backend)
 
     ret = []
-    if conn.type in [Provider.NEPHOSCALE]:
+    if conn.type in [Provider.NEPHOSCALE, Provider.AZURE]:
         networks = conn.ex_list_networks()
 
         for network in networks:
