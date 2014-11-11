@@ -1772,17 +1772,14 @@ def list_networks(user, backend_id):
             ret.append({
                 'id': network.id,
                 'name': network.name,
-                'extra': network.extra
+                'extra': network.extra,
+                'can_delete': False
             })
-
-        return ret
     elif conn.type in [Provider.OPENSTACK]:
         networks = conn.ex_list_neutron_networks()
         for network in networks:
             ret.append(openstack_network_to_dict(network))
-        return ret
-    else:
-        return ret
+    return ret
 
 
 def openstack_network_to_dict(network):
@@ -1790,10 +1787,11 @@ def openstack_network_to_dict(network):
     net['name'] = network.name
     net['id'] = network.id
     net['status'] = network.status
+    net['can_delete'] = True
+
 
     net['subnets'] = []
     for sub in network.subnets:
-
         net['subnets'].append(openstack_subnet_to_dict(sub))
     return net
 
