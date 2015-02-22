@@ -3458,7 +3458,8 @@ def machine_name_validator(provider, name):
     elif provider is Provider.NEPHOSCALE:
         pass
     elif provider is Provider.GCE:
-        pass
+        if not re.search(r'^[0-9a-z-]', name):
+            raise MachineNameValidationError("machine name must be lowercase letters, numbers, and hyphens")
     elif provider is Provider.SOFTLAYER:
         pass
     elif provider is Provider.DIGITAL_OCEAN:
