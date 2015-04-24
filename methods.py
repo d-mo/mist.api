@@ -216,7 +216,26 @@ def add_backend_v_2(user, title, provider, params):
     """
     if not provider:
         raise RequiredParameterMissingError("provider")
+
     log.info("Adding new backend in provider '%s' with Api-Version: 2", provider)
+
+    # perform hostname validation if hostname is supplied
+    if provider in ['vcloud', 'bare_metal', 'docker', 'libvirt', 'openstack', 'vsphere']:
+        if provider == 'vcloud':
+            hostname = params.get('host', '')
+        elif provider == 'bare_metal':
+            hostname = params.get('machine_ip', '')
+        elif provider == 'docker':
+            hostname = params.get('docker_host', '')
+        elif provider == 'libvirt':
+            hostname = params.get('machine_hostname', '')
+        elif provider == 'openstack':
+            hostname = params.get('auth_url', '')
+        elif provider == 'vsphere':
+            hostname = params.get('host', '')
+
+        if hostname:
+            hostname_validate(hostname)
 
     baremetal = provider == 'bare_metal'
 
@@ -296,6 +315,36 @@ def add_backend_v_2(user, title, provider, params):
         associate_key(user, key_id, backend_id, node_id, username=username)
 
     return {'backend_id': backend_id}
+
+
+def hostname_validate(hostname):
+    """
+    Performs hostname validation.
+    """
+
+    try:
+        ip = socket.gethostbyname(hostname)
+    except socket.gaierror:
+        raise BadRequestError("Hostname '%s' isn't resolvable/accessible."
+                              % hostname)
+
+    # do not allow localhost when in SaaS https://mist.io
+    try:
+        from mist.core import config
+        if hostname in ['localhost', '127.0.0.1', '0.0.0.0']:
+            raise BadRequestError("Hostname cannot be localhost, please specify a valid hostname")
+        try:
+            if is_private_subnet(hostname):
+                raise BadRequestError("Hostname '%s' isn't resolvable/accessible."
+                              % hostname)
+        except:
+            pass
+    except ImportError:
+        # this is a standalone io installation
+        pass
+
+    return True
+
 
 
 def _add_backend_bare_metal(user, title, provider, params):
